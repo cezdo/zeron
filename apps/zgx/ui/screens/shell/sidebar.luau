@@ -158,7 +158,7 @@ local sent: sessions.Places? = nil
 local sent_at = 0
 local ANSWER_MS = 5000
 ui.effect(function()
-	local theirs = plain(sessions.now:get().places)
+	local theirs = plain(sessions.places:get())
 	-- (Their places as they were: nothing to take.)
 	if heard and same(theirs, heard) then
 		return
@@ -197,7 +197,7 @@ end)
 -- Your sections' folds are the engine's, on every device: what it says
 -- folds them here, and folding one here tells it.
 ui.effect(function()
-	local sections = sessions.now:get().places.sections
+	local sections = sessions.places:get().sections
 	local mine = shared.folded:peek()
 	local next: { [string]: boolean }? = nil
 	for _, s in sections do
@@ -246,12 +246,12 @@ end)
 
 -- Device names, by id; this Mac's.
 local function devices(): ({ [string]: string }, string?)
-	local now = sessions.now:get()
 	local names: { [string]: string } = {}
 	local here: string? = nil
-	for _, d in now.devices do
+	local here_id = sessions.here:get()
+	for _, d in sessions.devices:get() do
 		names[d.id] = d.name
-		if d.here or d.id == now.here then
+		if d.here or d.id == here_id then
 			here = d.name
 		end
 	end
@@ -341,10 +341,9 @@ end
 -- The Archived shelf's sessions (the most recently moved first), as the
 -- list's rows read them.
 local shelf = ui.computed(function(): { any }
-	local now = sessions.now:get()
 	local names = devices()
 	local out = {}
-	for _, c in now.archived or {} do
+	for _, c in sessions.archived:get() do
 		table.insert(out, {
 			id = c.id,
 			title = c.title,
@@ -370,7 +369,7 @@ local function only_project(): string?
 	if not id then
 		return nil
 	end
-	for _, p in sessions.now:get().projects do
+	for _, p in sessions.projects:get() do
 		if p.id == id then
 			return id
 		end
@@ -591,7 +590,7 @@ local function project_filter(): Node
 				items = function(): { any }
 					local out: { any } = { { value = ALL, label = locale.s("shell.sidebar.project_filter.all_projects"), icon = "folder-with-files" } }
 					-- (A repository once, as the list has it.)
-					local all = sessions.now:get().projects
+					local all = sessions.projects:get()
 					local seen: { [string]: boolean } = {}
 					for _, p in all do
 						local first = oldest_checkout(p, all)
@@ -687,7 +686,7 @@ local CONNECTION: { [string]: string } = {
 	reconnecting = "shell.sidebar.connection.reconnecting",
 }
 local function connection(): string?
-	local c = (sessions.now:get() :: any).connection
+	local c: any = sessions.connection:get()
 	return if type(c) == "string" and CONNECTION[c] then c else nil
 end
 local function connection_line(): Node
@@ -1180,7 +1179,7 @@ local project_remove_open = ui.state("shell_project_remove_open", false)
 -- Of a repository on several devices, the checkouts to remove, by id.
 local project_remove_chosen = ui.state("shell_project_remove_chosen", {} :: { [string]: boolean })
 local function project_of(id: string?): sessions.Project?
-	for _, p in sessions.now:get().projects do
+	for _, p in sessions.projects:get() do
 		if p.id == id then
 			return p
 		end
@@ -1225,7 +1224,7 @@ local function project_dialogs(): Node
 	-- The checkouts of the project being removed (one, for most).
 	local function acting_checkouts(): { any }
 		local p = project_of(project_acting:get())
-		return if p then checkouts_of(p, sessions.now:get().projects) else {}
+		return if p then checkouts_of(p, sessions.projects:get()) else {}
 	end
 	local function device_of(q: any): string
 		for _, d in sessions.now:peek().devices do
@@ -1256,7 +1255,7 @@ local function project_dialogs(): Node
 			end
 		end
 		local device = locale.s("shell.sidebar.project.its_device")
-		for _, d in sessions.now:get().devices do
+		for _, d in sessions.devices:get() do
 			if p and d.id == p.device then
 				device = d.name
 			end
