@@ -25,6 +25,7 @@ local art = require("@app/screens/shell/art")
 local shared = require("@app/screens/chat/shared")
 local sessions = require("@account/sessions")
 local LinkNotice = require("@app/screens/chat/link_notice")
+local CloudTray = require("@app/screens/chat/cloud_tray")
 local Where = require("@app/screens/chat/where")
 local DropOverlay = require("@ds/drop_overlay")
 local Asks = require("@app/screens/chat/asks")
@@ -82,7 +83,7 @@ local function equal(a: any, b: any): boolean
 end
 -- The tray open behind the composer (its todos, tasks or queue), kept
 -- across a reload.
-local TRAY = ui.state("chat_tray", nil :: ("todos" | "tasks" | "queue")?)
+local TRAY = ui.state("chat_tray", nil :: ("todos" | "tasks" | "queue" | "alert")?)
 
 local function Composer(): Node
 	-- The session shown, or nil on a new chat.
@@ -384,6 +385,19 @@ local function Composer(): Node
 		asked = ui.state("chat_asked_by", nil :: any),
 	}
 	local ask, queue = asks.ask, asks.queue
+	-- Its Cloud machine, on a chat that has one: its state and its alert.
+	local machine = CloudTray.bind {
+		chat = function(): string?
+			return session_id:get()
+		end,
+		device = function(): string?
+			local s = open()
+			return s and s.device
+		end,
+		running = function(): boolean
+			return running:get()
+		end,
+	}
 	-- A line above it: one of its own (a send that failed), else the
 	-- session's.
 	local own_notice = ui.state("chat_own_notice", nil :: any)
@@ -428,6 +442,7 @@ local function Composer(): Node
 		end
 		return LinkNotice.of {
 			connection = now.connection,
+			cloud = machine.cloud_link(),
 			host_unreachable = host_unreachable,
 			host = host,
 			intent = string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0,
@@ -917,6 +932,11 @@ local function Composer(): Node
 			on_dismiss_notice = function()
 				own_notice:set(nil)
 			end,
+			-- (The only line with an action: a sleeping machine's Wake.)
+			on_notice_action = machine.wake,
+			alert = machine.tray,
+			alert_body = CloudTray.Body(machine),
+			on_dismiss_alert = machine.dismiss,
 			disabled = function(): boolean
 				local s = store.session:get()
 				local id = session_id:get()

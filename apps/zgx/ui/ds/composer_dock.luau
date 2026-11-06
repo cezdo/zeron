@@ -25,6 +25,10 @@
 -- its neighbours, "N earlier" and "N later" opening the rest. What is
 -- running is ours: a row a task or terminal, how long it has run, Stop at
 -- its end, Stop all in the header.
+--
+-- An alert is one more tray, nearest the pill, as nothing else can go until
+-- it's dealt with (`alert`, its folded line; `alert_body`, what opens under
+-- it): the words are the caller's, and it's only there while they say so.
 
 local Icon = require("@self/icon")
 local IconButtonModule = require("@self/icon_button")
@@ -62,7 +66,9 @@ export type Task = {
 	-- Done: how it ended ("exited 0").
 	ended: string?,
 }
-export type Tray = "todos" | "tasks" | "queue"
+export type Tray = "todos" | "tasks" | "queue" | "alert"
+-- `key`: a new one is news, and `opens` comes in open if no other tray is.
+export type Alert = { key: string, tone: string?, title: string, summary: string?, dismissable: boolean?, opens: boolean? }
 export type Props = {
 	queue: State<{ Queued }>?,
 	-- Whether the agent takes a word mid-turn (a row's action is then Steer).
@@ -81,6 +87,9 @@ export type Props = {
 	tasks: State<{ Task }>?,
 	on_stop_task: ((id: string) -> ())?,
 	on_stop_all: (() -> ())?,
+	alert: State<Alert?>?,
+	alert_body: Node?,
+	on_dismiss_alert: (() -> ())?,
 	-- Which tray is open; the dock keeps its own when not given.
 	open: State<Tray?>?,
 	-- Short of room: rows lose their thumbnails, actions become glyphs.
@@ -200,8 +209,8 @@ end
 type Head = {
 	id: Tray,
 	glyph: Node,
-	-- (Its title's message's key.)
-	title: string,
+	-- (Its title's message's key; or, its own words, a function.)
+	title: string | () -> string,
 	count: (() -> string)?,
 	summary: (() -> string)?,
 	trail: { Node }?,
@@ -213,7 +222,7 @@ local function head(opts: Head, open: State<Tray?>, height: number): Node
 	local parts: { Child } = {
 		ui.div { w = 18, h = 18, shrink = 0, items = "center", justify = "center", color = "$text.secondary", opts.glyph },
 		ui.text {
-			locale.t(opts.title),
+			if type(opts.title) == "string" then locale.t(opts.title) else opts.title,
 			shrink = 0,
 			text_size = "$font.size.md",
 			weight = "$font.weight.medium",
@@ -274,7 +283,8 @@ local function head(opts: Head, open: State<Tray?>, height: number): Node
 		cursor = "pointer",
 		role = "button",
 		label = function()
-			return locale.s(if is_open() then "ds.composer_dock.fold" else "ds.composer_dock.open", { title = locale.s(opts.title) })
+			local title = if type(opts.title) == "string" then locale.s(opts.title) else opts.title()
+			return locale.s(if is_open() then "ds.composer_dock.fold" else "ds.composer_dock.open", { title = title })
 		end,
 		expanded = is_open,
 		hover = { bg = "$hover" },
@@ -293,6 +303,7 @@ end
 -- A tray: the glass, its top corners, its inset by level (1 just behind
 -- the pill, 2 behind that…), tucked under what is below it.
 local function tray(level: () -> number, head_node: Node, body: Node, open: () -> boolean, geometry: { [string]: number }, key: string): Node
+	local cap = if key == "alert" then geometry.alert_body else geometry.body
 	local step, tuck, radius = geometry.step, geometry.tuck, geometry.radius
 	return ui.column {
 		shrink = 0,
@@ -315,7 +326,7 @@ local function tray(level: () -> number, head_node: Node, body: Node, open: () -
 		pt = "$space.1",
 		pb = ui.raw(tuck + 4, "the tuck, and the tray's own inset"),
 		head_node,
-		folding(open, geometry.body, body, key),
+		folding(open, cap, body, key),
 	}
 end
 
@@ -741,7 +752,9 @@ M.Dock = ui.component(function(props: Props): Node
 		tuck = n("zeron.composer.tray.tuck", 10),
 		header = n("zeron.composer.tray.header", 32),
 		row = n("zeron.composer.tray.row", 32),
+		-- (An alert's words and sizes want more than a list's rows do.)
 		body = n("zeron.composer.tray.body", 216),
+		alert_body = 340,
 	}
 	local open: State<Tray?> = props.open or ui.use_state(nil :: Tray?)
 	local narrow = props.narrow or function()
@@ -766,15 +779,21 @@ M.Dock = ui.component(function(props: Props): Node
 	local function has_tasks(): boolean
 		return props.tasks ~= nil and #props.tasks:get() > 0
 	end
+	local function has_alert(): boolean
+		return props.alert ~= nil and props.alert:get() ~= nil
+	end
 	-- Each tray's level: how many trays sit between it and the pill, and one.
-	local function queue_level(): number
+	local function alert_level(): number
 		return 1
 	end
+	local function queue_level(): number
+		return 1 + (if has_alert() then 1 else 0)
+	end
 	local function tasks_level(): number
-		return 1 + (if has_queue() then 1 else 0)
+		return queue_level() + (if has_queue() then 1 else 0)
 	end
 	local function todos_level(): number
-		return 1 + (if has_queue() then 1 else 0) + (if has_tasks() then 1 else 0)
+		return tasks_level() + (if has_tasks() then 1 else 0)
 	end
 	-- A tray arriving while none is open, opens; one gone while open,
 	-- closes; the plan folds itself once every step is done and the turn
@@ -798,6 +817,21 @@ M.Dock = ui.component(function(props: Props): Node
 			open:set(nil)
 		elseif now == "tasks" and not has_tasks() then
 			open:set(nil)
+		elseif now == "alert" and not has_alert() then
+			open:set(nil)
+		end
+	end)
+	-- An alert with nothing to choose comes in open, while no other tray is;
+	-- put away, the same one doesn't come back open.
+	local alert_seen: string? = nil
+	ui.effect(function()
+		local a = if props.alert then props.alert:get() else nil
+		local key = if a then a.key else nil
+		if key ~= alert_seen then
+			alert_seen = key
+			if a and a.opens and open:peek() == nil then
+				open:set("alert")
+			end
 		end
 	end)
 	-- What is running doesn't: it stays folded to its header ("Running 3 ·
@@ -1117,6 +1151,58 @@ M.Dock = ui.component(function(props: Props): Node
 					end,
 					summary = summary,
 				}, open, geometry.header), body, opened("queue"), geometry, "queue")
+			)
+		)
+	end
+
+	-- The alert.
+	if props.alert and props.alert_body then
+		local alert = props.alert
+		-- (Its words as it goes: nothing, for the frame it's still there.)
+		local function now(): Alert
+			return alert:get() or ({ key = "", title = "" } :: Alert)
+		end
+		local trail: { Node } = {}
+		if props.on_dismiss_alert then
+			table.insert(trail, ui.show(function()
+				return now().dismissable == true
+			end, IconButton {
+				icon = "close",
+				label = locale.t("ds.composer_dock.dismiss"),
+				tooltip = locale.s("ds.composer_dock.dismiss"),
+				size = "sm",
+				tone = "quiet",
+				on_click = function()
+					(props.on_dismiss_alert :: () -> ())()
+				end,
+			}))
+		end
+		table.insert(
+			trays,
+			ui.show(
+				has_alert,
+				tray(alert_level, head({
+					id = "alert",
+					glyph = ui.div {
+						color = function(): string
+							local tone = now().tone or "neutral"
+							return if tone == "neutral" then "$text.secondary" else `$zeron.tone.{tone}.ink`
+						end,
+						Icon {
+							name = function(): Icon.Name
+								return if now().tone == "neutral" then "clock-circle" else "danger-triangle"
+							end,
+							size = 16,
+						},
+					},
+					title = function(): string
+						return now().title
+					end,
+					summary = function(): string
+						return now().summary or ""
+					end,
+					trail = trail,
+				}, open, geometry.header), props.alert_body, opened("alert"), geometry, "alert")
 			)
 		)
 	end

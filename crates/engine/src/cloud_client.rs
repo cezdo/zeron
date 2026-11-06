@@ -79,6 +79,11 @@ impl SessionAction {
     }
 }
 
+/// Starts the error of a wake the edge refused as too small for the machine's
+/// disk, so a client can tell it from any other failure across the RPC's
+/// plain-text errors. The edge's own sentence follows it.
+pub const DISK_TOO_SMALL: &str = "disk_too_small";
+
 /// Shown for anything forwarded to the logical Cloud device, which has no
 /// engine: work happens on a session's own device.
 pub const ACCOUNT_DEVICE_HAS_NO_ENGINE: &str = "Cloud itself isn't a machine — open a session";
@@ -271,6 +276,74 @@ impl CloudClient {
                 &[],
                 Some(body),
                 "Start a Cloud session",
+            )
+            .await
+            .map_err(Failure::into_error)
+    }
+
+    /// `PUT /cloud/{orgId}/machine` with `{machine}`: the size new chats start
+    /// on. The status is read again afterwards, so what comes back is the
+    /// account as the edge has it, whatever that route's own reply holds.
+    pub async fn set_machine(&self, machine: &str) -> Result<CloudStatus, EngineError> {
+        require_id(machine, "machine")?;
+        self.target()?
+            .call_raw(
+                reqwest::Method::PUT,
+                &["cloud", "machine"],
+                &[],
+                Some(serde_json::json!({ "machine": machine })),
+                "Choose a Cloud machine",
+            )
+            .await
+            .map_err(Failure::into_error)?;
+        self.status().await
+    }
+
+    /// `POST /cloud/{orgId}/sessions/{chatId}/wake` with `{machine?}`: on that
+    /// size. A size too small is refused with a typed 409 (see
+    /// [`DISK_TOO_SMALL`]).
+    pub async fn wake_session(
+        &self,
+        chat_id: &str,
+        machine: Option<&str>,
+    ) -> Result<CloudSession, EngineError> {
+        self.session_on(chat_id, "wake", machine, SessionAction::Wake.verb())
+            .await
+    }
+
+    /// `POST /cloud/{orgId}/sessions/{chatId}/retry` with `{machine?}`: a failed
+    /// lifecycle again, or a fresh machine once its data expired.
+    pub async fn retry_session(
+        &self,
+        chat_id: &str,
+        machine: Option<&str>,
+    ) -> Result<CloudSession, EngineError> {
+        self.session_on(chat_id, "retry", machine, "Start a fresh Cloud machine")
+            .await
+    }
+
+    async fn session_on(
+        &self,
+        chat_id: &str,
+        action: &str,
+        machine: Option<&str>,
+        what: &str,
+    ) -> Result<CloudSession, EngineError> {
+        require_id(chat_id, "chatId")?;
+        let body = match machine {
+            Some(machine) => {
+                require_id(machine, "machine")?;
+                serde_json::json!({ "machine": machine })
+            }
+            None => serde_json::json!({}),
+        };
+        self.target()?
+            .call::<CloudSession>(
+                reqwest::Method::POST,
+                &["cloud", "sessions", chat_id, action],
+                &[],
+                Some(body),
+                what,
             )
             .await
             .map_err(Failure::into_error)
@@ -781,6 +854,8 @@ pub(crate) fn handles(method: &str) -> bool {
             | methods::CLOUD_SESSIONS
             | methods::CLOUD_SESSION_WAKE
             | methods::CLOUD_SESSION_SLEEP
+            | methods::CLOUD_SET_MACHINE
+            | methods::CLOUD_SESSION_RETRY
             | methods::CLOUD_SESSION_DELETE
             | methods::VAULT_STATUS
             | methods::VAULT_CONNECT_CODEX
@@ -855,6 +930,20 @@ struct ChatParams {
     chat_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SizedChatParams {
+    chat_id: String,
+    #[serde(default)]
+    machine: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MachineParams {
+    machine: String,
+}
+
 /// Ids interpolated into an edge path: the edge's own id charset, so a value
 /// can never add a path segment or query.
 fn require_id(value: &str, what: &str) -> Result<(), EngineError> {
@@ -896,13 +985,26 @@ pub(crate) async fn dispatch(
         methods::CLOUD_DELETE => RpcReply::value(&cloud.delete().await.map_err(failed)?),
         methods::CLOUD_SESSIONS => RpcReply::value(&cloud.sessions().await.map_err(failed)?),
         methods::CLOUD_SESSION_WAKE => {
-            let p: ChatParams = params(raw)?;
+            let p: SizedChatParams = params(raw)?;
             RpcReply::value(
                 &cloud
-                    .session_action(&p.chat_id, SessionAction::Wake)
+                    .wake_session(&p.chat_id, p.machine.as_deref())
                     .await
                     .map_err(failed)?,
             )
+        }
+        methods::CLOUD_SESSION_RETRY => {
+            let p: SizedChatParams = params(raw)?;
+            RpcReply::value(
+                &cloud
+                    .retry_session(&p.chat_id, p.machine.as_deref())
+                    .await
+                    .map_err(failed)?,
+            )
+        }
+        methods::CLOUD_SET_MACHINE => {
+            let p: MachineParams = params(raw)?;
+            RpcReply::value(&cloud.set_machine(&p.machine).await.map_err(failed)?)
         }
         methods::CLOUD_SESSION_SLEEP => {
             let p: ChatParams = params(raw)?;
@@ -1218,6 +1320,11 @@ fn edge_error(status: u16, body: &[u8], what: &str) -> EngineError {
         (_, status) => format!("{what} failed ({status})."),
     });
     tracing::warn!(status, code = code.as_deref().unwrap_or(""), %what, "cloud: edge refused");
+    // The one refusal a client acts on rather than shows: kept in the text, as
+    // an RPC's error is only text.
+    if code.as_deref().is_some_and(|c| c.contains("too_small")) {
+        return EngineError::Other(format!("{DISK_TOO_SMALL}: {text}"));
+    }
     EngineError::Other(text)
 }
 
@@ -1466,6 +1573,153 @@ mod tests {
                 serde_json::json!({"error": "not_found", "message": "no route"}),
             ),
         }
+    }
+
+    fn machine_edge(
+        method: &str,
+        target: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let session = |extra: serde_json::Value| {
+            let mut s = serde_json::json!({"chatId": "chat-1", "deviceId": "cloud-s1",
+                "spaceId": "sp-1", "state": "sleeping", "createdAt": 1});
+            s.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            s
+        };
+        match (method, target) {
+            ("GET", "/cloud/org_1") => (
+                200,
+                serde_json::json!({"state": "ready", "available": true, "machine": "large",
+                    "machines": [{"id": "xlarge", "name": "Extra large", "vcpu": 8,
+                        "memoryGB": 32, "diskGiB": 400, "creditMultiplier": 5.56}]}),
+            ),
+            ("GET", "/cloud/org_1/sessions") => (
+                200,
+                serde_json::json!({"sessions": [
+                    session(serde_json::json!({
+                        "machine": "default",
+                        "disk": {"usedGiB": 41.5, "capacityGiB": 50, "level": "warn"},
+                        "wakeBlocked": {"reason": "disk_too_small", "neededGiB": 150},
+                        "expiresAt": 1_800_000_000_000_i64,
+                    })),
+                    session(serde_json::json!({"chatId": "chat-2", "state": "data_expired"})),
+                ]}),
+            ),
+            ("PUT", "/cloud/org_1/machine") => (200, serde_json::json!({"ok": true})),
+            ("POST", "/cloud/org_1/sessions/chat-1/retry") => {
+                (200, session(serde_json::json!({"state": "provisioning"})))
+            }
+            ("POST", "/cloud/org_1/sessions/chat-1/wake") => {
+                if body["machine"] == "small" {
+                    return (
+                        409,
+                        serde_json::json!({"error": "machine_too_small", "message": "That machine holds 20 GB."}),
+                    );
+                }
+                (200, session(serde_json::json!({"state": "starting"})))
+            }
+            _ => (404, serde_json::json!({})),
+        }
+    }
+
+    #[tokio::test]
+    async fn machines_disk_and_expiry_read_from_the_edge() {
+        let edge = MockEdge::start(machine_edge).await;
+        let client = edge.client("org_1");
+
+        let status = client.status().await.unwrap();
+        assert_eq!(status.machine.as_deref(), Some("large"));
+        assert_eq!(status.machines[0].disk_gib, 400.0);
+        assert_eq!(status.machines[0].memory_gb, 32.0);
+        assert_eq!(status.machines[0].credit_multiplier, 5.56);
+
+        let listed = client.sessions().await.unwrap().sessions;
+        let disk = listed[0].disk.as_ref().unwrap();
+        assert_eq!((disk.used_gib, disk.capacity_gib), (41.5, 50.0));
+        assert_eq!(disk.level, "warn");
+        let blocked = listed[0].wake_blocked.as_ref().unwrap();
+        assert_eq!(blocked.reason, "disk_too_small");
+        assert_eq!(blocked.needed_gib, Some(150.0));
+        assert_eq!(listed[0].expires_at, Some(1_800_000_000_000.0));
+        assert_eq!(listed[1].state, CloudState::DataExpired);
+        // (What the app reads is what the engine says of it: the same names.)
+        let again = serde_json::to_value(&listed[1]).unwrap();
+        assert_eq!(again["state"], "data_expired");
+        let again = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(again["wakeBlocked"]["neededGiB"], 150.0);
+        assert_eq!(again["disk"]["usedGiB"], 41.5);
+    }
+
+    #[tokio::test]
+    async fn an_old_edge_s_session_and_status_still_read() {
+        let session: CloudSession = serde_json::from_value(serde_json::json!({
+            "chatId": "c", "deviceId": "d", "spaceId": "s", "state": "ready", "createdAt": 1
+        }))
+        .unwrap();
+        assert_eq!(session.machine, None);
+        assert_eq!(session.disk, None);
+        assert_eq!(session.wake_blocked, None);
+        assert_eq!(session.expires_at, None);
+        let status: CloudStatus =
+            serde_json::from_value(serde_json::json!({ "state": "ready", "available": true }))
+                .unwrap();
+        assert!(status.machines.is_empty());
+        assert_eq!(status.machine, None);
+    }
+
+    #[tokio::test]
+    async fn waking_on_a_size_and_choosing_the_default() {
+        let edge = MockEdge::start(machine_edge).await;
+        let client = edge.client("org_1");
+
+        let woke = client.wake_session("chat-1", Some("large")).await.unwrap();
+        assert_eq!(woke.state, CloudState::Starting);
+        let sent = edge.requests.lock().unwrap().last().unwrap().clone();
+        assert_eq!(sent.body, serde_json::json!({ "machine": "large" }));
+
+        // A plain wake sends nothing it wasn't asked to.
+        client.wake_session("chat-1", None).await.unwrap();
+        let sent = edge.requests.lock().unwrap().last().unwrap().clone();
+        assert_eq!(sent.body, serde_json::json!({}));
+        // A fresh machine is the retry route's.
+        let fresh = client.retry_session("chat-1", Some("xlarge")).await.unwrap();
+        assert_eq!(fresh.state, CloudState::Provisioning);
+        let sent = edge.requests.lock().unwrap().last().unwrap().clone();
+        assert_eq!(sent.target, "/cloud/org_1/sessions/chat-1/retry");
+        assert_eq!(sent.body, serde_json::json!({ "machine": "xlarge" }));
+
+        // The typed refusal stays tellable across the RPC's plain text, with
+        // the edge's sentence after it.
+        let refused = client
+            .wake_session("chat-1", Some("small"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "disk_too_small: That machine holds 20 GB."
+        );
+        // Names never reach an edge path or body unchecked.
+        assert!(
+            client
+                .wake_session("chat-1", Some("../x"))
+                .await
+                .is_err()
+        );
+
+        let status = client.set_machine("large").await.unwrap();
+        assert_eq!(status.machine.as_deref(), Some("large"));
+        let puts: Vec<_> = edge
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .cloned()
+            .collect();
+        assert_eq!(puts[0].target, "/cloud/org_1/machine");
+        assert_eq!(puts[0].body, serde_json::json!({ "machine": "large" }));
     }
 
     #[tokio::test]

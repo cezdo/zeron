@@ -191,6 +191,10 @@ export type Props = {
 	-- own; otherwise the pill's own sense of it).
 	dropping: State<boolean>?,
 
+	-- An alert behind it, nearest the pill (ds/composer_dock's).
+	alert: State<dock.Alert?>?,
+	alert_body: Node?,
+	on_dismiss_alert: (() -> ())?,
 	-- The trays behind it (ds/composer_dock's).
 	queue: State<{ dock.Queued }>?,
 	can_steer: (boolean | () -> boolean)?,
@@ -2298,8 +2302,11 @@ return ui.component(function(props: Props): Node
 
 	-- The trays, behind the pill.
 	local trays: Node? = nil
-	if props.queue or props.todos or props.tasks then
+	if props.queue or props.todos or props.tasks or props.alert then
 		trays = dock.Dock {
+			alert = props.alert,
+			alert_body = props.alert_body,
+			on_dismiss_alert = props.on_dismiss_alert,
 			queue = props.queue,
 			can_steer = props.can_steer,
 			on_queue_send = props.on_queue_send,

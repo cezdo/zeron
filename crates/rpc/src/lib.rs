@@ -358,6 +358,11 @@ pub mod methods {
     /// to a sleeping session wakes it on its own (the host nudge).
     pub const CLOUD_SESSION_WAKE: &str = "CloudSessionWake";
     pub const CLOUD_SESSION_SLEEP: &str = "CloudSessionSleep";
+    /// The size new Cloud chats start on: `{machine}`; answers `CloudStatus`.
+    pub const CLOUD_SET_MACHINE: &str = "CloudSetMachine";
+    /// `{chatId, machine?}` → `CloudSession`. Retry a failed lifecycle; on a
+    /// session whose data expired, a fresh machine on the same repo and branch.
+    pub const CLOUD_SESSION_RETRY: &str = "CloudSessionRetry";
     /// `{chatId}` → `CloudSession` (`Deleting`). Deletes the sandbox and
     /// anything uncommitted in it; the transcript stays.
     pub const CLOUD_SESSION_DELETE: &str = "CloudSessionDelete";

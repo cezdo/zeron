@@ -94,6 +94,55 @@ pub enum CloudState {
     Deleting,
     /// Last lifecycle step failed; see `error` / `failed_action`.
     Error,
+    /// Session: slept past its retention, so the machine's files are gone (the
+    /// conversation is kept). The one state whose wire name has an underscore.
+    #[serde(rename = "data_expired", alias = "dataExpired")]
+    DataExpired,
+}
+
+/// One size of Cloud machine, as the edge offers it. The edge's list is the
+/// truth: clients show what it says and never assume a set of sizes.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudMachine {
+    /// What's sent back to pick it (`small`, `default`, `large`, `xlarge`).
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub vcpu: f64,
+    #[serde(default, rename = "memoryGB")]
+    pub memory_gb: f64,
+    #[serde(default, rename = "diskGiB")]
+    pub disk_gib: f64,
+    /// Credits per minute relative to the standard machine (xlarge: 5.56).
+    #[serde(default)]
+    pub credit_multiplier: f64,
+}
+
+/// How full a session machine's disk is.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudDisk {
+    #[serde(default, rename = "usedGiB")]
+    pub used_gib: f64,
+    #[serde(default, rename = "capacityGiB")]
+    pub capacity_gib: f64,
+    /// `ok` · `warn` · `critical` (a string: a level this build doesn't know
+    /// must not fail the whole list).
+    #[serde(default)]
+    pub level: String,
+}
+
+/// Why a session can't wake on the machine it has.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWakeBlocked {
+    /// `disk_too_small`.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default, rename = "neededGiB", skip_serializing_if = "Option::is_none")]
+    pub needed_gib: Option<f64>,
 }
 
 /// `CloudStatus` / `CloudEnable` / `CloudDelete` reply: the account.
@@ -129,10 +178,16 @@ pub struct CloudStatus {
     /// or wake at zero or below. `None` from an edge that predates credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<f64>,
+    /// The sizes on offer. Empty from an edge that predates machine choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<CloudMachine>,
+    /// The size new chats start on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// One Cloud session: a top-level chat run on Cloud and its sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudSession {
     pub chat_id: String,
@@ -153,10 +208,23 @@ pub struct CloudSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_at: Option<i64>,
     pub created_at: i64,
+    /// The size it runs on ([`CloudMachine::id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<CloudDisk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_blocked: Option<CloudWakeBlocked>,
+    /// Unix ms the machine's files go, while it sleeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<f64>,
+    /// How far a waking machine has got, where the edge says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
 }
 
 /// `CloudSessions` reply.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudSessions {
     #[serde(default)]
